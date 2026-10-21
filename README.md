@@ -1,0 +1,2 @@
+# ci-templates
+Pipeline reutilizável
