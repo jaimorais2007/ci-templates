@@ -1,0 +1,231 @@
+# Pipeline reutilizável para os microsserviços .NET do Tech Challenge Fase 4.
+# Uso: cada serviço chama este workflow (veja ci-cd.yml de exemplo).
+#
+# Etapas:
+#   1. build-test-quality (PR e push na main): build, testes com cobertura,
+#      análise no SonarCloud com quality gate e checagem de cobertura mínima.
+#   2. docker (só push na main): build e push da imagem para o GHCR (gratuito).
+#   3. deploy (só push na main, quando deploy: true): aplica os manifestos
+#      no Kubernetes e atualiza a imagem do Deployment.
+
+name: dotnet-service
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Nome do serviço (usado na imagem, no Deployment e no container)"
+        required: true
+        type: string
+      sonar-project-key:
+        description: "Project key no SonarCloud (ex.: jaimorais2007_os-service)"
+        required: true
+        type: string
+      sonar-organization:
+        description: "Organization key no SonarCloud"
+        required: false
+        type: string
+        default: "jaimorais2007"
+      dotnet-version:
+        description: "Versão do SDK .NET"
+        required: false
+        type: string
+        default: "8.0.x"
+      solution-path:
+        description: "Caminho da solution (.sln) ou da pasta raiz"
+        required: false
+        type: string
+        default: "."
+      coverage-threshold:
+        description: "Cobertura mínima de linhas (%)"
+        required: false
+        type: number
+        default: 80
+      dockerfile:
+        description: "Caminho do Dockerfile"
+        required: false
+        type: string
+        default: "Dockerfile"
+      platforms:
+        description: "Arquiteturas da imagem (use linux/arm64 para k3s na Oracle Ampere)"
+        required: false
+        type: string
+        default: "linux/amd64"
+      k8s-manifests:
+        description: "Pasta com os manifestos Kubernetes"
+        required: false
+        type: string
+        default: "k8s"
+      k8s-namespace:
+        description: "Namespace do Kubernetes"
+        required: false
+        type: string
+        default: "oficina"
+      deploy:
+        description: "Executa o deploy no Kubernetes após o push da imagem"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      SONAR_TOKEN:
+        required: true
+      KUBE_CONFIG:
+        description: "kubeconfig do cluster em base64 (obrigatório quando deploy: true)"
+        required: false
+
+jobs:
+  build-test-quality:
+    name: Build, testes e qualidade
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # o Sonar precisa do histórico completo
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Setup Java (exigido pelo scanner do Sonar)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar ferramentas
+        run: |
+          dotnet tool install --global dotnet-sonarscanner
+          dotnet tool install --global dotnet-reportgenerator-globaltool
+
+      - name: Sonar - iniciar análise
+        run: >
+          dotnet sonarscanner begin
+          /k:"${{ inputs.sonar-project-key }}"
+          /o:"${{ inputs.sonar-organization }}"
+          /d:sonar.token="${SONAR_TOKEN}"
+          /d:sonar.host.url="https://sonarcloud.io"
+          /d:sonar.cs.opencover.reportsPaths="${{ github.workspace }}/TestResults/**/coverage.opencover.xml"
+          /d:sonar.coverage.exclusions="**/Migrations/**,**/Program.cs,**/*Tests*/**"
+          /d:sonar.qualitygate.wait=true
+
+      - name: Build
+        run: dotnet build ${{ inputs.solution-path }} --configuration Release
+
+      - name: Testes com cobertura
+        run: >
+          dotnet test ${{ inputs.solution-path }}
+          --configuration Release
+          --no-build
+          --collect:"XPlat Code Coverage;Format=opencover"
+          --results-directory ${{ github.workspace }}/TestResults
+          --logger trx
+
+      - name: Sonar - enviar análise e aguardar quality gate
+        run: dotnet sonarscanner end /d:sonar.token="${SONAR_TOKEN}"
+
+      - name: Checar cobertura mínima
+        if: ${{ !cancelled() }}
+        run: |
+          reportgenerator \
+            -reports:"${{ github.workspace }}/TestResults/**/coverage.opencover.xml" \
+            -targetdir:coverage-report \
+            -reporttypes:"JsonSummary;MarkdownSummaryGithub;Html"
+          cat coverage-report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+          COV=$(jq '.summary.linecoverage' coverage-report/Summary.json)
+          echo "Cobertura de linhas: ${COV}% (mínimo: ${{ inputs.coverage-threshold }}%)"
+          if awk -v c="$COV" -v t="${{ inputs.coverage-threshold }}" 'BEGIN { exit !(c+0 < t+0) }'; then
+            echo "::error::Cobertura ${COV}% abaixo do mínimo de ${{ inputs.coverage-threshold }}%"
+            exit 1
+          fi
+
+      - name: Publicar relatório de cobertura
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ inputs.service-name }}
+          path: coverage-report
+
+  docker:
+    name: Build e push da imagem
+    needs: build-test-quality
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Definir nome da imagem
+        id: image
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${OWNER}/${{ inputs.service-name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+
+  deploy:
+    name: Deploy no Kubernetes
+    needs: docker
+    if: inputs.deploy && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configurar acesso ao cluster
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          if [ -z "$KUBE_CONFIG" ]; then
+            echo "::error::Secret KUBE_CONFIG não configurado neste repositório"
+            exit 1
+          fi
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Aplicar manifestos
+        run: |
+          kubectl create namespace ${{ inputs.k8s-namespace }} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -n ${{ inputs.k8s-namespace }} -f ${{ inputs.k8s-manifests }}
+
+      - name: Atualizar imagem e aguardar rollout
+        run: |
+          kubectl set image -n ${{ inputs.k8s-namespace }} \
+            deployment/${{ inputs.service-name }} \
+            ${{ inputs.service-name }}=${{ needs.docker.outputs.image }}:${{ github.sha }}
+          kubectl rollout status -n ${{ inputs.k8s-namespace }} \
+            deployment/${{ inputs.service-name }} --timeout=180s
