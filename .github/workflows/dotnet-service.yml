@@ -110,6 +110,7 @@ jobs:
           /d:sonar.host.url="https://sonarcloud.io"
           /d:sonar.cs.opencover.reportsPaths="${{ github.workspace }}/TestResults/**/coverage.opencover.xml"
           /d:sonar.coverage.exclusions="**/Migrations/**,**/Program.cs,**/*Tests*/**"
+          /d:sonar.exclusions="**/coverage-report/**,**/TestResults/**"
           /d:sonar.qualitygate.wait=true
 
       - name: Build
@@ -133,6 +134,7 @@ jobs:
           reportgenerator \
             -reports:"${{ github.workspace }}/TestResults/**/coverage.opencover.xml" \
             -targetdir:coverage-report \
+            "-filefilters:-*/Migrations/*;-*/Program.cs" \
             -reporttypes:"JsonSummary;MarkdownSummaryGithub;Html"
           cat coverage-report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
           COV=$(jq '.summary.linecoverage' coverage-report/Summary.json)
